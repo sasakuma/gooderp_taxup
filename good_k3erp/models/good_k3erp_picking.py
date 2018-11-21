@@ -24,30 +24,46 @@ import pymssql
 import xlrd
 import xlwt
 import base64
+import re
+import odoo.addons.decimal_precision as dp
 from odoo.exceptions import UserError
 
 import sys
 reload(sys)
 sys.setdefaultencoding('utf8')
-
+# 字段只读状态
+READONLY_STATES = {
+        'done': [('readonly', True)],
+    }
 #增加引出K3销售相关内容
-class GoodK3ErpOut(models.Model):
-    _inherit = 'tax.invoice.out'
+class GoodK3Erppicking(models.Model):
+    _name = 'tax.invoice.picking'
 
+    _order = "name"
+    name = fields.Many2one(
+        'finance.period',
+        u'会计期间',
+        ondelete='restrict',
+        required=True,
+        states=READONLY_STATES)
+    line_ids = fields.One2many('tax.invoice.picking.line', 'order_id', u'材料领用明细',
+                               states=READONLY_STATES, copy=False)
+    state = fields.Selection([('draft', u'草稿'),
+                              ('done', u'已结束')], u'状态', default='draft')
     k3_sql = fields.Many2one('k3.category', u'自方公司', copy=False)
     attachment_number = fields.Integer(compute='_compute_attachment_number', string=u'附件号')
 
     @api.multi
     def action_get_attachment_view(self):
         res = self.env['ir.actions.act_window'].for_xml_id('base', 'action_attachment')
-        res['domain'] = [('res_model', '=', 'tax.invoice.out'), ('res_id', 'in', self.ids)]
-        res['context'] = {'default_res_model': 'tax.invoice.out', 'default_res_id': self.id}
+        res['domain'] = [('res_model', '=', 'tax.invoice.picking'), ('res_id', 'in', self.ids)]
+        res['context'] = {'default_res_model': 'tax.invoice.picking', 'default_res_id': self.id}
         return res
 
     @api.multi
     def _compute_attachment_number(self):
         attachment_data = self.env['ir.attachment'].read_group(
-            [('res_model', '=', 'tax.invoice.out'), ('res_id', 'in', self.ids)], ['res_id'], ['res_id'])
+            [('res_model', '=', 'tax.invoice.picking'), ('res_id', 'in', self.ids)], ['res_id'], ['res_id'])
         attachment = dict((data['res_id'], data['res_id_count']) for data in attachment_data)
         for expense in self:
             expense.attachment_number = attachment.get(expense.id, 0)
@@ -79,72 +95,54 @@ class GoodK3ErpOut(models.Model):
                 ncols += 1
         return list,colnames
 
-    #插入物料
+    # 插入PAGE1
     @api.multi
-    def createexcel(self, excel, line, worksheet, number, groups_name, max_code, colnames):
-
-        for i in excel:
-            # 修改内容。
-            i[u'名称'] = line.product_name #名称
-            i[u'规格型号'] = line.product_type #规格型号
-            i[u'计量单位组_FName']=i[u'基本计量单位_FGroupName']=i[u'采购计量单位_FGroupName']=i[u'销售计量单位_FGroupName']=i[u'生产计量单位_FGroupName']=i[u'库存计量单位_FGroupName'] = groups_name #单位组
-            i[u'采购计量单位_FName'] = i[u'销售计量单位_FName'] = i[u'生产计量单位_FName'] = i[u'库存计量单位_FName']  =i[u'基本计量单位_FName']=line.product_unit #单位
-            i[u'存货科目代码_FNumber'] = self.k3_sql.stock_code_out #存货科目代码
-            i[u'销售收入科目代码_FNumber'] = self.k3_sql.income_code_out #销售收入科目代码
-            i[u'销售成本科目代码_FNumber'] = self.k3_sql.cost_code_out #销售成本科目代码
-            i[u'代码'] = max_code #物料代码
-
-        j = 0
-        for key in colnames:
-            # 写入excel
-            worksheet.write(number,j,i[key])
-            j += 1
-
-    # 插入发票
-    @api.multi
-    def createinvoice(self, conn, line, excel, worksheet, colnames, number):
-        partner_code = self.search_patner_code(conn, line.partner_name_out)
+    def createpicking(self, conn, excel, worksheet, colnames, number):
         dep_code,dep_name = self.search_department(conn)
         user_code,user_name = self.search_user(conn)
+        max_code = self.search_max_fbillno(conn)[0]
+        t = int(re.findall("\d+", max_code)[0])
+        billno = '%s%s' % ('SOUT', "%06d" % (t + 1))
         for i in excel:
             # 修改内容。
-            i[u'审核日期'] = i[u'日      期'] = i[u'收款日期'] = line.invoice_date
-            i[u'发票号码'] = line.name
-            i[u'购货单位_FNumber'] = partner_code
-            i[u'购货单位_FName'] = line.partner_name_out
-            i[u'部门_FNumber'] = dep_code
-            i[u'部门_FName'] = dep_name
+            i[u'审核日期'] = i[u'日期'] = self.env['finance.period'].get_period_month_date_range(self.name)[
+            1]
+            i[u'编    号'] = billno
+            i[u'领料部门_FNumber'] = dep_code
+            i[u'领料部门_FName'] = dep_name
             i[u'制单人_FName'] = i[u'审核人_FName'] = u'宣一敏'
-            i[u'主管_FNumber'] = i[u'业务员_FNumber'] = user_code
-            i[u'主管_FName'] = i[u'业务员_FName'] = user_name
-            i[u'往来科目_FNumber'] = self.k3_sql.ke_sale_id
-            i[u'往来科目_FName'] = self.k3_sql.ke_sale_name
+            i[u'领料_FNumber'] = i[u'发料_FNumber'] = user_code
+            i[u'领料_FName'] = i[u'发料_FName'] = user_name
+            i[u'对方科目_FNumber'] = self.k3_sql.ke_picking_id
+            i[u'对方科目_FName'] = self.k3_sql.ke_picking_name
         j = 0
         for key in colnames:
             # 写入excel
             worksheet.write(number,j,i[key])
             j += 1
 
-    # 插入发票明细
+    # 插入PAGE2
     @api.multi
-    def createinvoiceline(self, conn, line, excel, worksheet, colnames, number, line_number):
-        good_id = self.search_goods(conn, line)
-        if not good_id:
-            raise UserError('请到K3系统增加产品：%s。'% (line.product_name))
-        good_code, good_name, good_model = good_id
+    def createpickingline(self, conn, line, excel, worksheet, colnames, number, line_number):
         unit_code = self.search_groups_name(conn, line)
+        max_code = self.search_max_fbillno(conn)[0]
+        t = int(re.findall("\d+", max_code)[0])
+        billno = '%s%s' % ('SOUT', "%06d" % (t + 1))
+        wearhouse = self.search_wearhouse(conn)
+        wearhouse_code, wearhouse_name = wearhouse
         for i in excel:
             # 修改内容。
             i[u'行号'] = str(line_number)
-            i[u'单据号_FBillno'] = line.order_id.name
-            i[u'产品代码_FNumber'] = good_code
-            i[u'产品代码_FName'] = line.product_name
-            i[u'数量'] = i[u'基本单位数量'] = line.product_count
-            i[u'金额'] = i[u'金额(本位币)'] = line.product_amount
-            i[u'税额'] = i[u'税额(本位币)'] = line.product_tax
-            i[u'单价'] = round(line.product_amount/line.product_count,6)
-            i[u'单位_FName'] = line.product_unit
+            i[u'单据号_FBillno'] = billno
+            i[u'物料代码_FNumber'] = line.product_code
+            i[u'物料代码_FName'] = line.product_name
+            i[u'实发数量'] = i[u'基本单位实发数量'] = line.number
+            i[u'金额'] = line.amount
+            i[u'单价'] = line.price
+            i[u'单位_FName'] = line.unit
             i[u'单位_FNumber'] = unit_code
+            i[u'发料仓库_FNumber'] = wearhouse_code
+            i[u'发料仓库_FName'] = wearhouse_name
 
         j = 0
         for key in colnames:
@@ -152,22 +150,13 @@ class GoodK3ErpOut(models.Model):
             worksheet.write(number, j, i[key])
             j += 1
 
-    #合并负数项
-    @api.multi
-    def hebenginvoice(self, invoice):
-        for line in invoice.line_ids:
-            if line.product_amount < 0:
-                hebeng_line = self.env['cn.account.invoice.line'].search([('product_name', '=', line.product_name),('product_amount', '>=', abs(line.product_amount)),('order_id', '=', line.order_id.id)], limit = 1)
-                hebeng_line.write({'product_amount': line.product_amount+hebeng_line.product_amount,'product_tax': line.product_tax+hebeng_line.product_tax,'note': u'合并产品%s，金额%s'%(line.product_name,line.product_amount)})
-                line.unlink()
-
-
     # 导出K3销售发票
     @api.multi
-    def exp_k3(self):
-        xls_data = xlrd.open_workbook('./excel/sale_invoice.xls')
+    def picking_order(self):
+        xls_data = xlrd.open_workbook('./excel/picking.xls')
         Page1 = xls_data.sheet_by_name('Page1')
         Page2 = xls_data.sheet_by_name('Page2')
+        Page3 = xls_data.sheet_by_name('Page3')
         Page4 = xls_data.sheet_by_name('t_Schema')
         conn = self.createConnection()
         excel1, colnames1 = self.readexcel(Page1)  # 读模版，返回字典及表头数组
@@ -175,6 +164,8 @@ class GoodK3ErpOut(models.Model):
         workbook = xlwt.Workbook(encoding='utf-8')  # 生成文件
         worksheet = workbook.add_sheet(u'Page1')  # 在文件中创建一个名为Page1的sheet
         worksheet2 = workbook.add_sheet(u'Page2')
+        worksheet3 = workbook.add_sheet(u'Page3')
+        self.worksheetcopy(Page3, worksheet3)
         worksheet4 = workbook.add_sheet(u't_Schema')
         self.worksheetcopy(Page4, worksheet4)
         i = j = number = number2 =0
@@ -184,79 +175,32 @@ class GoodK3ErpOut(models.Model):
         for key in colnames2:
             worksheet2.write(0,i,key)
             i += 1
+        number += 1
+        self.createpicking(conn, excel1, worksheet, colnames1, number)
+        line_number = 0
         for line in self.line_ids:
-            self.hebenginvoice(line)
-        for invoice in self.line_ids:
-            number += 1
-            self.createinvoice(conn, invoice, excel1, worksheet, colnames1, number)
-            line_number = 0
-            for line in invoice.line_ids:
-                if line.product_amount <= 0:
-                    continue
-                number2 += 1
-                line_number += 1
-                self.createinvoiceline(conn, line, excel2, worksheet2, colnames2, number2, line_number)
+            number2 += 1
+            line_number += 1
+            self.createpickingline(conn, line, excel2, worksheet2, colnames2, number2, line_number)
 
-        workbook.save('sale_invoice.xls')
+        workbook.save('picking.xls')
         self.closeConnection(conn)
         # 生成附件
-        f = open('sale_invoice.xls', 'rb')
+        f = open('picking.xls', 'rb')
         self.env['ir.attachment'].create({
             'datas': base64.b64encode(f.read()),
-            'name': u'K3销售发票导入',
-            'datas_fname': u'%s销售发票%s.xls' % (self.k3_sql.name, self.name.name),
-            'res_model': 'tax.invoice.out',
+            'name': u'k3生产领料单导入',
+            'datas_fname': u'%sk3生产领料单%s.xls' % (self.k3_sql.name, self.name.name),
+            'res_model': 'tax.invoice.picking',
             'res_id': self.id, })
 
-    # 导出K3物料
+    # 查询入库单最大编号
     @api.multi
-    def exp_k3_goods(self,order = False):
-        xls_data = xlrd.open_workbook('./excel/good.xls')
-        Page1 = xls_data.sheet_by_name('Page1')
-        Page2 = xls_data.sheet_by_name('Page2')
-        Page3 = xls_data.sheet_by_name('Page3')
-        Page4 = xls_data.sheet_by_name('t_Schema')
-        #连接数据库
-        conn = self.createConnection()
-        excel,colnames = self.readexcel(Page1) #读模版，返回字典及表头数组
-        workbook = xlwt.Workbook(encoding = 'utf-8')   # 生成文件
-        worksheet = workbook.add_sheet(u'Page1')# 在文件中创建一个名为Page1的sheet
-        worksheet2 = workbook.add_sheet(u'Page2')
-        self.worksheetcopy(Page2,worksheet2)
-        worksheet3 = workbook.add_sheet(u'Page3')
-        self.worksheetcopy(Page3, worksheet3)
-        worksheet4 = workbook.add_sheet(u't_Schema')
-        self.worksheetcopy(Page4, worksheet4)
-
-        i = j = 0
-        good = []
-        values = self.k3_sql.stock_code_out
-        max_code = self.search_max_code(conn,values)[0]
-        for key in colnames:
-            worksheet.write(0,j,key)
-            j += 1
-        for invoice in self.line_ids:
-            for line in invoice.line_ids:
-                good_id = self.search_goods(conn,line)
-                if not good_id:
-                    if (line.product_name + line.product_type) in good:
-                        continue
-                    good.append(line.product_name + line.product_type)
-                    groups_name = self.search_groups_name(conn, line)[0]
-                    i += 1
-                    code = self.get_new_code(max_code,i)
-                    self.createexcel(excel, line, worksheet, i, groups_name.encode('latin-1').decode('gbk'), code, colnames)
-
-        workbook.save(u'goods.xls')
-        self.closeConnection(conn)
-        # 生成附件
-        f = open('goods.xls', 'rb')
-        self.env['ir.attachment'].create({
-            'datas': base64.b64encode(f.read()),
-            'name': u'K3销售物料导出',
-            'datas_fname': u'%s物料%s.xls' % (self.k3_sql.name, self.name.name),
-            'res_model': 'tax.invoice.out',
-            'res_id': self.id, })
+    def search_max_fbillno(self, conn):
+        cursor = conn.cursor()
+        cursor.execute("select max(FBillno) from ICStockBill where ftrantype = '24';")
+        FBillno = cursor.fetchone()
+        return FBillno
 
     @api.multi
     def get_new_code(self, code, i):
@@ -312,7 +256,7 @@ class GoodK3ErpOut(models.Model):
     def search_goods(self, conn, line):
         cursor = conn.cursor()
         sql = "select fnumber,fname,fmodel from t_ICItem WHERE fname='%s' and fmodel='%s';"
-        values = (line.product_name, line.product_type)
+        values = (line.product_name2, "")
         cursor.execute(sql%values)
         good_id = cursor.fetchone()
         if good_id:
@@ -320,19 +264,27 @@ class GoodK3ErpOut(models.Model):
         else:
             return False
 
+    # 查询仓库
+    @api.multi
+    def search_wearhouse(self, conn):
+        cursor = conn.cursor()
+        cursor.execute("select top 1 FNumber,Fname from t_Stock ;")
+        wearhouse = cursor.fetchone()
+        return wearhouse
+
     # 查询单位组
     @api.multi
     def search_groups_name(self, conn, line):
         cursor = conn.cursor()
         sql = "select Funitgroupid from t_MeasureUnit WHERE fname='%s';"
-        values = (line.product_unit)
+        values = (line.unit)
         cursor.execute(sql%values)
         groups_id = cursor.fetchone()
         if groups_id:
             cursor.execute("select fname from t_UnitGroup WHERE Funitgroupid='%s';"%(groups_id))
             groups_name = cursor.fetchone()
         else:
-            raise UserError('请到K3系统增加计量单位%s。产品：%s。'% (line.product_unit,line.product_name))
+            raise UserError('请到K3系统增加计量单位%s。产品：%s。'% (line.unit,line.product_name))
         return groups_name
 
     # 查询单位CODE
@@ -381,3 +333,94 @@ class GoodK3ErpOut(models.Model):
         cursor.execute("select top 1 FNumber,Fname from t_Emp ;")
         user = cursor.fetchone()
         return user
+
+
+    @api.multi
+    def button_excel(self):
+        return {
+            'name': u'引入excel',
+            'view_mode': 'form',
+            'view_type': 'form',
+            'res_model': 'create.tax.picking.wizard',
+            'type': 'ir.actions.act_window',
+            'target': 'new',
+        }
+
+class GoodK3ErpPickingLine(models.Model):
+    _name = 'tax.invoice.picking.line'
+
+    order_id = fields.Many2one('tax.invoice.picking', u'生产单', index=True, copy=False, readonly=True)
+    product_code = fields.Char(u'物料长代码')
+    product_name = fields.Char(u'物料名称')
+    product_name2 = fields.Char(u'规格型号')
+    unit= fields.Char(u'单位')
+    amount = fields.Float(u'金额')
+    number = fields.Float(u'数量')
+    price = fields.Float(u'单价')
+
+#导入金穗发票，生成产成品明细
+class create_tax_picking_wizard(models.TransientModel):
+    _name = 'create.tax.picking.wizard'
+    _description = 'picking Import'
+
+    excel = fields.Binary(u'导入excel文件',)
+
+    @api.one
+    def create_picking(self):
+        """
+        通过Excel文件导入信息到tax.invoice
+        """
+        producting = self.env['tax.invoice.picking'].browse(self.env.context.get('active_id'))
+        if not producting:
+            return {}
+        xls_data = xlrd.open_workbook(
+                file_contents=base64.decodestring(self.excel))
+        table = xls_data.sheets()[0]
+        #取得行数
+        ncows = table.nrows
+        #取得第3行数据
+        colnames =  table.row_values(2)
+        list =[]
+        newcows = 0
+        for rownum in range(3,ncows):
+            row = table.row_values(rownum)
+            if row:
+                app = {}
+                for i in range(len(colnames)):
+                   app[colnames[i]] = row[i]
+                #过滤掉不需要的行，详见销货清单的会在清单中再次导入
+                if app.get(u'单价') :
+                    list.append(app)
+                    newcows += 1
+        #数据读入。
+        invoice_id = False
+        for data in range(0,newcows):
+            in_xls_data = list[data]
+            product_code = in_xls_data.get(u'物料长代码')
+            product_name = in_xls_data.get(u'物料名称')
+            product_name2 = in_xls_data.get(u'规格型号')
+            unit = in_xls_data.get(u'单位')
+            amount = in_xls_data.get(u'金额')
+            number = in_xls_data.get(u'数量')
+            price = in_xls_data.get(u'单价')
+            if in_xls_data.get(u'单价'):
+                self.env['tax.invoice.picking.line'].create({
+                    'product_code': product_code,
+                    'product_name': product_name,
+                    'product_name2': product_name2,
+                    'unit':unit,
+                    'amount': amount,
+                    'number': number,
+                    'price': price,
+                    'order_id': producting.id,
+                })
+
+
+    def excel_date(self,data):
+        #将excel日期改为正常日期
+        if type(data) in (int,float):
+            year, month, day, hour, minute, second = xlrd.xldate_as_tuple(data,0)
+            py_date = datetime.datetime(year, month, day, hour, minute, second)
+        else:
+            py_date = data
+        return py_date

@@ -44,14 +44,14 @@ class BankForm(models.Model):
         ondelete='restrict',
         required=True,
         states=READONLY_STATES)
-    begin_id =  fields.Integer(u'起始凭证号', required=True, copy=False,)
+    begin_id =  fields.Integer(u'起始凭证号', copy=False,)
     line_ids = fields.One2many('bank.form.line', 'order_id', u'对帐单明细',
                                states=READONLY_STATES, copy=False)
     state = fields.Selection([('draft', u'草稿'),
                               ('done', u'已结束')], u'状态', default='draft')
     is_tour = fields.Boolean(u'旅游公司')
     pos_id = fields.Char(u'K3_POS代码')
-    pos_name = fields.Char(u'K3K3_POS名称')
+    pos_name = fields.Char(u'K3_POS名称')
     attachment_number = fields.Integer(compute='_compute_attachment_number', string=u'附件号')
 
     @api.multi
@@ -114,17 +114,47 @@ class BankForm(models.Model):
             'res_id': self.id, })
 
     @api.multi
+    def check_partner(self):
+        conn = self.createConnection()
+        no_partner_in = u'请到K3系统增加客户:'
+        no_partner_out = u'请到K3系统增加供应商:'
+        partner_in = partner_out = []
+        for line in self.line_ids:
+            if line.amount_in:
+                partner_in_code = self.search_organization(conn, line.name)
+                if not partner_in_code and line.name:
+                    no_partner_in += ('%s,' % line.name)
+                    partner_in.append(line.name)
+            if line.amount_out:
+                partner_out_code = self.search_supplier(conn, line.name)
+                if not partner_out_code and line.name:
+                    no_partner_out += ('%s,' % line.name)
+                    partner_out.append(line.name)
+        if partner_in and partner_out:
+            note = no_partner_in + u'\n' + no_partner_out
+            raise UserError(note)
+        elif partner_in:
+            note = no_partner_in
+            raise UserError(note)
+        elif partner_out:
+            note = no_partner_out
+            raise UserError(note)
+
+
+    @api.multi
     def createvoucher(self, conn, excel, worksheet, d, number, colnames, bank_line):
         bank_name = self.name.k3_account_name
         bank_code = self.name.k3_account_code
         kehu_name = bank_line.note
+        partner_in_code = self.search_organization(conn, bank_line.name)
         if self.is_tour:
             kehu_code_name = '%s---%s' % (self.pos_id, self.pos_name)
+            partner_in_code = True
         elif bank_line.amount_in:
-            partner_in_code = self.search_organization(conn, bank_line.name)
             ku_name = bank_line.name
-            ke_code = partner_in_code[0]
-            kehu_code_name = '%s---%s'%(ke_code,ku_name)
+            if partner_in_code:
+                ke_code = partner_in_code[0]
+                kehu_code_name = '%s---%s'%(ke_code,ku_name)
         # 入库且有客户名称能找到：一般单证
         if bank_line.amount_in and partner_in_code:
             account_name = bank_name
@@ -199,13 +229,11 @@ class BankForm(models.Model):
             bank_line.write({'is_voucher': True})
 
         elif bank_line.amount_out and bank_line.name and bank_line.note:
-            print '99',bank_line.name,bank_line.note,bank_line.amount_out
             k3_account_id = self.env['bank.form.config'].search(
                 [('type', '=', 'out'), ('is_normal', '=', False), ('company_id', '=', self.name.company_id.id),
                  ('name', '=', bank_line.note)], limit=1)
             if not k3_account_id:
                 return d
-            print bank_line.note,k3_account_id
             account_name = k3_account_id.k3_account_name
             account_code = k3_account_id.k3_account_code
             amount = bank_line.amount_out
